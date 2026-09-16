@@ -1,0 +1,9 @@
+# Jim (JimGW) configuration created by asimov for {{ production.event.name }}/{{ production.name }}.
+#
+# This file is a thin pass-through: the actual config is assembled and
+# TOML-serialized in Python (see Jim.before_config / Jim._build_config in
+# asimov_jim/pipeline.py), because TOML is type-sensitive about strings vs
+# numbers vs booleans in a way plain Liquid text substitution handles badly.
+# Pipeline-specific overrides can be set under a `jim:` block in this
+# production's metadata; see the plugin README for the full schema.
+{{ production.meta['jim_rendered_toml'] }}
