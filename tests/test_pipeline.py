@@ -1,0 +1,427 @@
+"""Tests for the Jim (JimGW) pipeline integration."""
+
+import os
+from unittest.mock import Mock, patch
+
+import pytest
+import tomllib
+from asimov.pipeline import PipelineException
+from asimov.scheduler import Slurm
+
+from asimov_jim import Jim
+
+
+class TestJimInit:
+    """Test Jim initialization."""
+
+    def test_init_success(self, mock_production, mock_config):
+        pipeline = Jim(mock_production)
+        assert pipeline.name == "Jim"
+        assert pipeline.production == mock_production
+        assert "wait" in pipeline.STATUS
+
+    def test_init_wrong_pipeline(self, mock_production, mock_config):
+        mock_production.pipeline = "bilby"
+        with pytest.raises(PipelineException, match="Pipeline mismatch"):
+            Jim(mock_production)
+
+    def test_init_sets_up_logger(self, mock_production, mock_config):
+        pipeline = Jim(mock_production)
+        assert pipeline.logger is not None
+
+
+class TestConfigTemplate:
+    """Test the config_template property used by asimov's `manage build`
+    to render a TOML config when one doesn't already exist in the event
+    repository."""
+
+    def test_config_template_is_a_real_bundled_file(self, mock_production, mock_config):
+        pipeline = Jim(mock_production)
+        assert os.path.exists(pipeline.config_template)
+
+    def test_config_template_is_named_jim_toml(self, mock_production, mock_config):
+        pipeline = Jim(mock_production)
+        assert os.path.basename(pipeline.config_template) == "jim.toml"
+
+
+class TestBuildConfig:
+    """Test Jim._build_config(), the Python-side TOML assembly used by
+    before_config(). Assembled in Python (not the Liquid template, unlike
+    the sibling asimov-pycbc/pycbc.ini) because TOML is type-sensitive
+    about strings/numbers/booleans in a way plain text substitution
+    handles badly.
+    """
+
+    def test_gwosc_defaults(self, mock_production, mock_config):
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["data"]["type"] == "gwosc"
+        assert cfg["data"]["detectors"] == ["H1", "L1"]
+        assert cfg["data"]["trigger_time"] == 1126259462.4
+        assert cfg["waveform"]["approximant"] == "IMRPhenomXPHM"
+        assert cfg["waveform"]["f_ref"] == 20
+        # Network f_min/f_max: lowest/highest across interferometers.
+        assert cfg["likelihood"]["f_min"] == 20
+        assert cfg["likelihood"]["f_max"] == 896
+        assert cfg["sampler"]["type"] == "flowmc"
+        assert cfg["output"]["overwrite"] is True
+
+    def test_injection_data_type(self, mock_production, mock_config):
+        mock_production.meta["jim"] = {
+            "data": {
+                "type": "injection",
+                "sampling_frequency": 4096.0,
+                "duration": 4.0,
+                "zero_noise": True,
+                "injection_parameters": {"M_c": 28.0, "q": 0.9},
+            }
+        }
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["data"]["type"] == "injection"
+        assert cfg["data"]["zero_noise"] is True
+        assert cfg["data"]["injection_parameters"] == {"M_c": 28.0, "q": 0.9}
+
+    def test_file_data_type(self, mock_production, mock_config):
+        mock_production.meta["jim"] = {
+            "data": {
+                "type": "file",
+                "duration": 4.0,
+                "strain_files": {"H1": "/data/h1.gwf", "L1": "/data/l1.gwf"},
+                "psd_files": {"H1": "/data/h1_psd.npz", "L1": "/data/l1_psd.npz"},
+            }
+        }
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["data"]["type"] == "file"
+        assert cfg["data"]["strain_files"]["H1"] == "/data/h1.gwf"
+        assert cfg["data"]["psd_files"]["L1"] == "/data/l1_psd.npz"
+
+    def test_file_data_type_with_strain_channels(self, mock_production, mock_config):
+        mock_production.meta["jim"] = {
+            "data": {
+                "type": "file",
+                "strain_files": {"H1": "/data/h1.gwf"},
+                "psd_files": {"H1": "/data/h1_psd.npz"},
+                "strain_channels": {"H1": "H1:GDS-CALIB_STRAIN"},
+            }
+        }
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["data"]["strain_channels"] == {"H1": "H1:GDS-CALIB_STRAIN"}
+
+    def test_jim_overrides_take_precedence(self, mock_production, mock_config):
+        mock_production.meta["jim"] = {
+            "seed": 42,
+            "waveform": {"approximant": "IMRPhenomXAS", "f_ref": 50.0},
+            "likelihood": {"f_min": 15.0, "f_max": 512.0},
+        }
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["seed"] == 42
+        assert cfg["waveform"]["approximant"] == "IMRPhenomXAS"
+        assert cfg["waveform"]["f_ref"] == 50.0
+        assert cfg["likelihood"]["f_min"] == 15.0
+        assert cfg["likelihood"]["f_max"] == 512.0
+
+    def test_prior_falls_back_to_prior_interface(self, mock_production, mock_config):
+        mock_production.priors = {
+            "M_c": {"type": "uniform", "minimum": 10.0, "maximum": 80.0},
+        }
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["prior"] == {"M_c": {"type": "uniform", "min": 10.0, "max": 80.0}}
+
+    def test_explicit_jim_prior_overrides_interface(self, mock_production, mock_config):
+        mock_production.priors = {
+            "M_c": {"type": "uniform", "minimum": 10.0, "maximum": 80.0},
+        }
+        mock_production.meta["jim"] = {
+            "prior": {"M_c": {"type": "uniform", "min": 5.0, "max": 100.0}},
+        }
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["prior"] == {"M_c": {"type": "uniform", "min": 5.0, "max": 100.0}}
+
+    def test_checkpoint_dir_distinct_from_output_dir(self, mock_production, mock_config):
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["sampler"]["checkpoint_dir"] != cfg["output"]["dir"]
+
+    def test_no_likelihood_frequency_metadata_uses_jim_defaults(
+        self, mock_production, mock_config
+    ):
+        mock_production.meta["likelihood"] = {}
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["likelihood"]["f_min"] == 20.0
+        assert cfg["likelihood"]["f_max"] == 1024.0
+
+
+class TestBeforeConfig:
+    def test_before_config_stashes_valid_toml(self, mock_production, mock_config):
+        pipeline = Jim(mock_production)
+        pipeline.before_config()
+        rendered = mock_production.meta["jim_rendered_toml"]
+        parsed = tomllib.loads(rendered)
+        assert parsed["data"]["type"] == "gwosc"
+        assert parsed["output"]["overwrite"] is True
+
+
+class TestBuildDag:
+    """Test resolution of rundir and config file location."""
+
+    def test_build_dag_resolves_rundir(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        pipeline = Jim(mock_production)
+        toml_file = pipeline.build_dag()
+        assert os.path.isdir(mock_production.rundir)
+        assert toml_file.endswith("TestProduction.toml")
+
+    def test_build_dag_falls_back_to_rundir_default(
+        self, mock_production, mock_config, temp_dir
+    ):
+        mock_production.rundir = None
+        mock_config.get = lambda section, key: (
+            temp_dir if (section, key) == ("general", "rundir_default") else ""
+        )
+        pipeline = Jim(mock_production)
+        pipeline.build_dag()
+        assert mock_production.rundir == os.path.join(
+            temp_dir, mock_production.event.name, mock_production.name
+        )
+
+    def test_build_dag_raises_if_no_config_found(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        mock_production.event.repository.find_prods.return_value = []
+        pipeline = Jim(mock_production)
+        with pytest.raises(PipelineException, match="No configuration file found"):
+            pipeline.build_dag()
+
+    def test_build_dag_dryrun_does_not_raise(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        pipeline = Jim(mock_production)
+        pipeline.build_dag(dryrun=True)  # must not raise
+
+    def test_build_dag_without_event_repository(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        mock_production.event.repository = None
+        pipeline = Jim(mock_production)
+        toml_file = pipeline.build_dag()
+        assert toml_file == "TestProduction.toml"
+
+
+class TestSubmitDag:
+    """Test job submission via Asimov's scheduler abstraction."""
+
+    def test_submit_dag_uses_scheduler_abstraction(
+        self, mock_production, mock_config, temp_dir
+    ):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        with patch("asimov_jim.pipeline.shutil.which", return_value="/opt/conda/bin/jim-run"):
+            pipeline = Jim(mock_production)
+            pipeline._scheduler = Mock()
+            pipeline._scheduler.submit.return_value = 12345
+
+            cluster_id = pipeline.submit_dag(dryrun=False)
+
+        assert cluster_id == 12345
+        assert mock_production.job_id == 12345
+        assert mock_production.status == "running"
+        assert pipeline._scheduler.submit.called
+
+    def test_submit_dag_requests_gpu_on_htcondor(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        with patch("asimov_jim.pipeline.shutil.which", return_value="/opt/conda/bin/jim-run"):
+            pipeline = Jim(mock_production)
+            pipeline._scheduler = Mock()  # not a Slurm instance
+            pipeline._scheduler.submit.return_value = 1
+
+            pipeline.submit_dag(dryrun=False)
+
+        job = pipeline._scheduler.submit.call_args[0][0]
+        assert job.kwargs["request_gpus"] == "1"
+        assert "slurm_gres" not in job.kwargs
+
+    def test_submit_dag_requests_gpu_on_slurm(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        with patch("asimov_jim.pipeline.shutil.which", return_value="/opt/conda/bin/jim-run"):
+            pipeline = Jim(mock_production)
+            pipeline._scheduler = Mock(spec=Slurm)
+            pipeline._scheduler.submit.return_value = 1
+
+            pipeline.submit_dag(dryrun=False)
+
+        job = pipeline._scheduler.submit.call_args[0][0]
+        assert job.kwargs["slurm_gres"] == "gpu:1"
+        assert "request_gpus" not in job.kwargs
+
+    def test_submit_dag_dryrun_does_not_call_scheduler(
+        self, mock_production, mock_config, temp_dir
+    ):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        with patch("asimov_jim.pipeline.shutil.which", return_value="/opt/conda/bin/jim-run"):
+            pipeline = Jim(mock_production)
+            pipeline._scheduler = Mock()
+
+            result = pipeline.submit_dag(dryrun=True)
+
+        assert result is None
+        pipeline._scheduler.submit.assert_not_called()
+
+    def test_submit_dag_missing_executable_raises_clear_exception(
+        self, mock_production, mock_config, temp_dir
+    ):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        with patch("asimov_jim.pipeline.shutil.which", return_value=None):
+            pipeline = Jim(mock_production)
+            with pytest.raises(PipelineException, match="jim-run"):
+                pipeline.submit_dag(dryrun=False)
+
+    def test_submit_dag_scheduler_failure(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        with patch("asimov_jim.pipeline.shutil.which", return_value="/opt/conda/bin/jim-run"):
+            pipeline = Jim(mock_production)
+            pipeline._scheduler = Mock()
+            pipeline._scheduler.submit.side_effect = RuntimeError("could not submit")
+
+            with pytest.raises(PipelineException, match="could not be submitted"):
+                pipeline.submit_dag(dryrun=False)
+
+    def test_submit_dag_appends_verbose_flag(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        mock_production.meta["jim"] = {"verbose": True}
+        with patch("asimov_jim.pipeline.shutil.which", return_value="/opt/conda/bin/jim-run"):
+            pipeline = Jim(mock_production)
+            pipeline._scheduler = Mock()
+            pipeline._scheduler.submit.return_value = 1
+
+            pipeline.submit_dag(dryrun=False)
+
+        job = pipeline._scheduler.submit.call_args[0][0]
+        assert "--verbose" in job.kwargs["arguments"]
+
+    def test_submit_dag_sets_accounting_group(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        with patch("asimov_jim.pipeline.shutil.which", return_value="/opt/conda/bin/jim-run"):
+            pipeline = Jim(mock_production)
+            pipeline._scheduler = Mock()
+            pipeline._scheduler.submit.return_value = 1
+
+            pipeline.submit_dag(dryrun=False)
+
+        job = pipeline._scheduler.submit.call_args[0][0]
+        assert job.kwargs["accounting_group"] == "ligo.dev.o4.cbc.pe.jim"
+
+
+class TestDetectCompletion:
+    """Test completion detection via config.final.toml."""
+
+    def test_detect_completion_no_output(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = temp_dir
+        pipeline = Jim(mock_production)
+        assert pipeline.detect_completion() is False
+
+    def test_detect_completion_marker_present(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = temp_dir
+        output_dir = os.path.join(temp_dir, "output")
+        os.makedirs(output_dir)
+        with open(os.path.join(output_dir, "config.final.toml"), "w") as f:
+            f.write("seed = 0\n")
+        pipeline = Jim(mock_production)
+        assert pipeline.detect_completion() is True
+
+    def test_detect_completion_ignores_partial_output(self, mock_production, mock_config, temp_dir):
+        # samples.npz alone (without config.final.toml) means the run hasn't
+        # finished writing outputs yet.
+        mock_production.rundir = temp_dir
+        output_dir = os.path.join(temp_dir, "output")
+        os.makedirs(output_dir)
+        with open(os.path.join(output_dir, "samples.npz"), "w") as f:
+            f.write("x")
+        pipeline = Jim(mock_production)
+        assert pipeline.detect_completion() is False
+
+
+class TestSamplesAndAssets:
+    def test_samples_empty_when_no_output(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = temp_dir
+        pipeline = Jim(mock_production)
+        assert pipeline.samples() == []
+
+    def test_samples_returns_samples_file(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = temp_dir
+        output_dir = os.path.join(temp_dir, "output")
+        os.makedirs(output_dir)
+        samples_path = os.path.join(output_dir, "samples.npz")
+        with open(samples_path, "w") as f:
+            f.write("x")
+        pipeline = Jim(mock_production)
+        assert pipeline.samples() == [samples_path]
+
+    def test_collect_assets_includes_config(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = temp_dir
+        pipeline = Jim(mock_production)
+        assets = pipeline.collect_assets()
+        assert assets["config"] == "TestProduction.toml"
+        assert assets["samples"] == []
+
+
+class TestCollectLogs:
+    def test_collect_logs_reads_log_files(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = temp_dir
+        with open(os.path.join(temp_dir, "TestProduction.out"), "w") as f:
+            f.write("stdout contents")
+        with open(os.path.join(temp_dir, "TestProduction.err"), "w") as f:
+            f.write("stderr contents")
+        pipeline = Jim(mock_production)
+        logs = pipeline.collect_logs()
+        assert logs["TestProduction.out"] == "stdout contents"
+        assert logs["TestProduction.err"] == "stderr contents"
+
+    def test_collect_logs_empty_when_no_logs(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = temp_dir
+        pipeline = Jim(mock_production)
+        assert pipeline.collect_logs() == {}
+
+
+class TestAfterCompletion:
+    def test_after_completion_marks_production_finished(
+        self, mock_production, mock_config, temp_dir
+    ):
+        mock_production.rundir = temp_dir
+        mock_production.status = "running"
+        pipeline = Jim(mock_production)
+
+        pipeline.after_completion()
+
+        assert mock_production.status == "finished"
+
+
+class TestResurrect:
+    def test_resurrect_resubmits_job(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        mock_production.meta.pop("resurrections", None)
+        with patch("asimov_jim.pipeline.shutil.which", return_value="/opt/conda/bin/jim-run"):
+            pipeline = Jim(mock_production)
+            pipeline._scheduler = Mock()
+            pipeline._scheduler.submit.return_value = 99
+
+            pipeline.resurrect()
+
+        assert mock_production.meta["resurrections"] == 1
+        assert pipeline._scheduler.submit.called
+
+    def test_resurrect_gives_up_after_five_attempts(
+        self, mock_production, mock_config, temp_dir
+    ):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        mock_production.meta["resurrections"] = 5
+        with patch("asimov_jim.pipeline.shutil.which", return_value="/opt/conda/bin/jim-run"):
+            pipeline = Jim(mock_production)
+            pipeline._scheduler = Mock()
+
+            pipeline.resurrect()
+
+        pipeline._scheduler.submit.assert_not_called()
+        assert mock_production.meta["resurrections"] == 5
