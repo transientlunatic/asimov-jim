@@ -52,10 +52,10 @@ class TestBuildConfig:
     handles badly.
     """
 
-    def test_gwosc_defaults(self, mock_production, mock_config):
+    def test_defaults(self, mock_production, mock_config):
         pipeline = Jim(mock_production)
         cfg = pipeline._build_config()
-        assert cfg["data"]["type"] == "gwosc"
+        assert cfg["data"]["type"] == "file"
         assert cfg["data"]["detectors"] == ["H1", "L1"]
         assert cfg["data"]["trigger_time"] == 1126259462.4
         assert cfg["waveform"]["approximant"] == "IMRPhenomXPHM"
@@ -66,55 +66,40 @@ class TestBuildConfig:
         assert cfg["sampler"]["type"] == "flowmc"
         assert cfg["output"]["overwrite"] is True
 
-    def test_injection_data_type(self, mock_production, mock_config):
-        mock_production.meta["jim"] = {
-            "data": {
-                "type": "injection",
-                "sampling_frequency": 4096.0,
-                "duration": 4.0,
-                "zero_noise": True,
-                "injection_parameters": {"M_c": 28.0, "q": 0.9},
-            }
-        }
-        pipeline = Jim(mock_production)
-        cfg = pipeline._build_config()
-        assert cfg["data"]["type"] == "injection"
-        assert cfg["data"]["zero_noise"] is True
-        assert cfg["data"]["injection_parameters"] == {"M_c": 28.0, "q": 0.9}
-
-    def test_file_data_type(self, mock_production, mock_config):
-        mock_production.meta["jim"] = {
-            "data": {
-                "type": "file",
-                "duration": 4.0,
-                "strain_files": {"H1": "/data/h1.gwf", "L1": "/data/l1.gwf"},
-                "psd_files": {"H1": "/data/h1_psd.npz", "L1": "/data/l1_psd.npz"},
-            }
+    def test_data_reads_generic_data_files_block(self, mock_production, mock_config):
+        # Always Jim's "file" mode, reading already-resolved frame files
+        # from the same generic data: {"data files": {...}} key every
+        # pipeline reads -- populated upstream by a data-fetching
+        # production (e.g. asimov-gwdata) wired up via `needs:`, kept
+        # consistent across pipelines rather than Jim fetching its own
+        # data via its built-in gwosc/injection modes.
+        mock_production.meta["data"] = {
+            "data files": {"H1": "/data/h1.gwf", "L1": "/data/l1.gwf"},
+            "channels": {"H1": "H1:GDS-CALIB_STRAIN", "L1": "L1:GDS-CALIB_STRAIN"},
+            "segment length": 8.0,
         }
         pipeline = Jim(mock_production)
         cfg = pipeline._build_config()
         assert cfg["data"]["type"] == "file"
         assert cfg["data"]["strain_files"]["H1"] == "/data/h1.gwf"
-        assert cfg["data"]["psd_files"]["L1"] == "/data/l1_psd.npz"
+        assert cfg["data"]["strain_channels"]["L1"] == "L1:GDS-CALIB_STRAIN"
+        assert cfg["data"]["duration"] == 8.0
 
-    def test_file_data_type_with_strain_channels(self, mock_production, mock_config):
+    def test_data_psd_files_is_jim_specific(self, mock_production, mock_config):
+        # No generic Asimov vocabulary for PSD files, so these stay under
+        # jim: data:.
         mock_production.meta["jim"] = {
             "data": {
-                "type": "file",
-                "strain_files": {"H1": "/data/h1.gwf"},
-                "psd_files": {"H1": "/data/h1_psd.npz"},
-                "strain_channels": {"H1": "H1:GDS-CALIB_STRAIN"},
+                "psd_files": {"H1": "/data/h1_psd.npz", "L1": "/data/l1_psd.npz"},
             }
         }
         pipeline = Jim(mock_production)
         cfg = pipeline._build_config()
-        assert cfg["data"]["strain_channels"] == {"H1": "H1:GDS-CALIB_STRAIN"}
+        assert cfg["data"]["psd_files"]["L1"] == "/data/l1_psd.npz"
 
-    def test_file_data_type_with_psd_is_asd(self, mock_production, mock_config):
+    def test_data_psd_is_asd(self, mock_production, mock_config):
         mock_production.meta["jim"] = {
             "data": {
-                "type": "file",
-                "strain_files": {"H1": "/data/h1.gwf"},
                 "psd_files": {"H1": "/data/h1_asd.npz"},
                 "psd_is_asd": {"H1": True},
             }
@@ -122,6 +107,13 @@ class TestBuildConfig:
         pipeline = Jim(mock_production)
         cfg = pipeline._build_config()
         assert cfg["data"]["psd_is_asd"] == {"H1": True}
+
+    def test_data_without_channels_omits_strain_channels(
+        self, mock_production, mock_config
+    ):
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert "strain_channels" not in cfg["data"]
 
     def test_output_preserves_user_fields(self, mock_production, mock_config):
         mock_production.meta["jim"] = {
@@ -232,7 +224,7 @@ class TestBeforeConfig:
         pipeline.before_config()
         rendered = mock_production.meta["jim_rendered_toml"]
         parsed = tomllib.loads(rendered)
-        assert parsed["data"]["type"] == "gwosc"
+        assert parsed["data"]["type"] == "file"
         assert parsed["output"]["overwrite"] is True
 
     def test_before_config_resolves_rundir_when_unset(

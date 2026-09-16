@@ -75,53 +75,34 @@ class Jim(Pipeline):
         """
         meta = self.production.meta
         jim_meta = meta.get("jim") or {}
-        data_meta = jim_meta.get("data") or {}
+        jim_data_meta = jim_meta.get("data") or {}
         output_meta = jim_meta.get("output") or {}
+        asimov_data = meta.get("data") or {}
         asimov_waveform = meta.get("waveform") or {}
         asimov_sampler = meta.get("sampler") or {}
         ifos = meta.get("interferometers") or []
 
-        data_type = data_meta.get("type", "gwosc")
+        # Always Jim's "file" data mode, reading already-resolved frame
+        # files from the same generic data: {"data files": {...}} key every
+        # pipeline reads (populated by a separate data-fetching production,
+        # e.g. asimov-gwdata, wired up via `needs:`) -- kept consistent
+        # across pipelines rather than letting Jim fetch its own data via
+        # its built-in gwosc/injection modes. PSD files have no equivalent
+        # generic Asimov vocabulary, so those stay under `jim: data:`.
         data = {
-            "type": data_type,
+            "type": "file",
             "detectors": list(ifos),
-            "trigger_time": meta.get("event time", data_meta.get("trigger_time")),
+            "trigger_time": meta.get("event time"),
+            "duration": asimov_data.get("segment length", 4.0),
+            "strain_files": dict(asimov_data.get("data files") or {}),
+            "psd_files": dict(jim_data_meta.get("psd_files") or {}),
         }
-        if data_type == "injection":
-            data.update(
-                {
-                    "sampling_frequency": data_meta.get("sampling_frequency", 4096.0),
-                    "duration": data_meta.get("duration", 4.0),
-                    "zero_noise": bool(data_meta.get("zero_noise", False)),
-                    "injection_parameters": dict(
-                        data_meta.get("injection_parameters") or {}
-                    ),
-                }
-            )
-        elif data_type == "file":
-            data.update(
-                {
-                    "duration": data_meta.get("duration", 4.0),
-                    "strain_files": dict(data_meta.get("strain_files") or {}),
-                    "psd_files": dict(data_meta.get("psd_files") or {}),
-                }
-            )
-            channels = data_meta.get("strain_channels")
-            if channels:
-                data["strain_channels"] = dict(channels)
-            psd_is_asd = data_meta.get("psd_is_asd")
-            if psd_is_asd:
-                data["psd_is_asd"] = dict(psd_is_asd)
-        else:
-            data.update(
-                {
-                    "duration": data_meta.get("duration", 4.0),
-                    "post_trigger_duration": data_meta.get(
-                        "post_trigger_duration", 2.0
-                    ),
-                    "psd_duration": data_meta.get("psd_duration", 1024.0),
-                }
-            )
+        channels = asimov_data.get("channels")
+        if channels:
+            data["strain_channels"] = dict(channels)
+        psd_is_asd = jim_data_meta.get("psd_is_asd")
+        if psd_is_asd:
+            data["psd_is_asd"] = dict(psd_is_asd)
 
         # Not jim-specific -- read the same waveform: block every other
         # pipeline reads (bilby, pycbc, ...), no jim: override layer.

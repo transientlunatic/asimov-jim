@@ -94,7 +94,9 @@ Most of Jim's configuration maps directly onto the same generic Asimov
 vocabulary every other pipeline reads — there's no `jim:` override layer
 for any of these:
 
-- `interferometers`, `"event time"` → `[data]` detectors/trigger time
+- `interferometers`, `"event time"`, `data."data files"`, `data.channels`,
+  `data."segment length"` → `[data]` (see [Data](#data) below — Jim always
+  reads already-resolved frame files this way, never fetches its own)
 - `waveform.approximant`, `waveform."reference frequency"` → `[waveform]`
 - `likelihood."minimum/maximum frequency"` (lowest/highest across
   detectors) → `[likelihood] f_min`/`f_max`
@@ -117,9 +119,9 @@ for any of these:
 A small `jim:` block, set *in the ledger blueprint* (an `analysis`
 blueprint for a single production, or an `event`/`configuration` blueprint
 if shared), covers the handful of things that have no generic Asimov
-equivalent at all — Jim's choice of data source, its `[sampling]` section,
-output options, and an escape hatch for the two prior types the generic
-`priors:` mechanism can't express:
+equivalent at all — PSD file paths (see [Data](#data)), Jim's `[sampling]`
+section, output options, and an escape hatch for the two prior types the
+generic `priors:` mechanism can't express:
 
 ```yaml
 # added to an analysis (or event/configuration) blueprint
@@ -128,9 +130,8 @@ jim:
   verbose: false
 
   data:
-    type: gwosc               # gwosc (default) | injection | file -- see Data below
-    # injection: sampling_frequency, duration, zero_noise, injection_parameters
-    # file: duration, strain_files: {H1: ..., L1: ...}, psd_files: {...}, strain_channels: {...}, psd_is_asd: {...}
+    psd_files: {H1: ..., L1: ...}   # no generic equivalent -- see Data below
+    psd_is_asd: {H1: false, L1: false}
 
   sampling:
     time_frame: detector        # geocentric | detector -- passed straight through to Jim's [sampling] section
@@ -157,17 +158,45 @@ and can't be overridden.
 
 ### Data
 
-> **Still settling:** Jim's own `file` data mode wants literal file paths
-> (`strain_files`/`psd_files`), not the frame-type + channel pairs
-> (`data: {channels, "frame types"}`) other pipelines resolve themselves —
-> Jim has no frame-discovery of its own. Whether `asimov-jim` should only
-> ever consume already-resolved paths (e.g. from a `gwdata`-style
-> production wired up via `needs:`, matching the
-> [GWOSC cookbook](https://asimov.readthedocs.io/en/latest/ligo-cookbook/working-with-gwosc.html)
-> pattern) via the generic `data: {"data files": {...}}` key, with Jim's
-> built-in `gwosc`/`injection` fetch modes kept only as a non-standard
-> fallback, is still being worked out — don't take the `jim: data:` shape
-> above as settled.
+`asimov-jim` always uses Jim's `file` data mode and never Jim's own
+built-in `gwosc`/`injection` fetch modes — this production must already
+have real frame files resolved before it builds, exactly like every other
+pipeline, so that the data used is consistent across pipelines in the same
+project rather than each one fetching independently. Strain files come
+from the generic `data:` blueprint vocabulary (the
+[adding-a-pipeline tutorial](https://asimov.readthedocs.io/en/latest/tutorials/adding-a-pipeline.html)
+and [GWOSC cookbook](https://asimov.readthedocs.io/en/latest/ligo-cookbook/working-with-gwosc.html)
+show the canonical pattern), typically populated by a `pipeline: gwdata`
+production wired up via `needs:`:
+
+```yaml
+kind: analysis
+name: get-data
+pipeline: gwdata
+download:
+  - frames
+---
+kind: analysis
+name: GW150914_jim
+pipeline: jim
+event: GW150914_095045
+needs:
+  - get-data
+```
+
+```yaml
+# resolved onto the event by the gwdata production above
+data:
+  "data files": {H1: /path/to/H1.gwf, L1: /path/to/L1.gwf}
+  channels: {H1: H1:GWOSC-16KHZ_R1_STRAIN, L1: L1:GWOSC-16KHZ_R1_STRAIN}
+  "segment length": 4
+```
+
+→ Jim's `strain_files`/`strain_channels`/`duration`. There's no generic
+Asimov vocabulary for PSD files (pipelines that need them typically
+estimate their own, e.g. via a separate BayesWave PSD-generation
+production), so those stay under `jim: data: psd_files:`/`psd_is_asd:`
+(shown above) until a shared convention exists.
 
 ### Priors
 
