@@ -38,7 +38,6 @@ def mock_production():
         "scheduler": {
             "accounting group": "ligo.dev.o4.cbc.pe.jim",
             "cpus": 2,
-            "gpus": 1,
         },
     }
 

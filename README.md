@@ -32,40 +32,58 @@ pytest
 
 ## Usage
 
-Add a production to the event ledger with `pipeline: jim`:
+Ledger settings are added via blueprint files and `asimov apply`, not by
+hand-editing a flat ledger — and settings are inherited hierarchically
+(analysis > event/subject > pipeline defaults > global), so event-wide
+values like `interferometers`, `"event time"`, `waveform` and
+`likelihood` frequencies are set once on the *event* blueprint rather than
+repeated on every analysis. A minimal event blueprint:
 
 ```yaml
-productions:
-  - name: GW150914_jim
-    pipeline: jim
-    status: ready
+# event.yaml
+kind: event
+name: GW150914_095045
 
-    interferometers: [H1, L1]
-    "event time": 1126259462.4
+interferometers: [H1, L1]
+"event time": 1126259462.4
 
-    waveform:
-      approximant: IMRPhenomXPHM
-      "reference frequency": 20
+waveform:
+  approximant: IMRPhenomXPHM
+  "reference frequency": 20
 
-    likelihood:
-      "minimum frequency": {H1: 20, L1: 20}
-      "maximum frequency": {H1: 896, L1: 896}
+likelihood:
+  "minimum frequency": {H1: 20, L1: 20}
+  "maximum frequency": {H1: 896, L1: 896}
 
-    priors:
-      M_c: {type: uniform, minimum: 10.0, maximum: 80.0}
-      q: {type: uniform, minimum: 0.125, maximum: 1.0}
-      iota: {type: sine}
-      dec: {type: cosine}
+priors:
+  M_c: {type: uniform, minimum: 10.0, maximum: 80.0}
+  q: {type: uniform, minimum: 0.125, maximum: 1.0}
+  iota: {type: sine}
+  dec: {type: cosine}
+```
 
-    scheduler:
-      cpus: 2
-      gpus: 1
-      "request memory": 8192MB
-      "accounting group": ligo.dev.o4.cbc.pe.jim
+and an analysis blueprint attaching a Jim production to it (only settings
+specific to *this* analysis — pipeline choice, scheduler resources, any
+`jim:` overrides — belong here; everything above is inherited):
+
+```yaml
+# jim-analysis.yaml
+kind: analysis
+name: GW150914_jim
+pipeline: jim
+event: GW150914_095045
+
+scheduler:
+  cpus: 2
+  gpus: 1
+  "request memory": 8192MB
+  "accounting group": ligo.dev.o4.cbc.pe.jim
 ```
 
 ```bash
-asimov manage build       # render TestProduction.toml from the ledger
+asimov apply -f event.yaml
+asimov apply -f jim-analysis.yaml
+asimov manage build       # render this analysis's TOML config (ledger input -> config.toml, not the other way round)
 asimov manage submit      # submit the jim-run job
 asimov monitor            # poll for completion
 ```
@@ -77,12 +95,17 @@ cleanly onto a single generic Asimov vocabulary, since Jim supports several
 data-loading modes (`gwosc`, `injection`, `file`) and five sampler backends
 each with their own settings. Common fields (`interferometers`,
 `"event time"`, `waveform.approximant`, `likelihood."minimum/maximum
-frequency"`) are picked up automatically, same as other pipelines, but
-anything Jim-specific is set under a `jim:` block, whose sub-sections mirror
+frequency"`) are picked up automatically from whichever blueprint set them
+(same as other pipelines), but anything Jim-specific is set under a `jim:`
+block *in the ledger blueprint* (an `analysis` blueprint for a single
+production, or an `event`/`configuration` blueprint if you want it shared
+across several). Its sub-sections mirror
 [Jim's own TOML config](https://gw-jax-team.github.io/Jim/stable/quickstart/)
-almost exactly:
+almost exactly, and the plugin renders that ledger input into Jim's actual
+`config.toml` file when you run `asimov manage build`:
 
 ```yaml
+# added to an analysis (or event/configuration) blueprint
 jim:
   seed: 0
   verbose: false
@@ -90,7 +113,7 @@ jim:
   data:
     type: gwosc               # gwosc (default) | injection | file
     # injection: sampling_frequency, duration, zero_noise, injection_parameters
-    # file: duration, strain_files: {H1: ..., L1: ...}, psd_files: {...}
+    # file: duration, strain_files: {H1: ..., L1: ...}, psd_files: {...}, strain_channels: {...}, psd_is_asd: {...}
 
   waveform:
     approximant: IMRPhenomXPHM
@@ -99,6 +122,10 @@ jim:
   likelihood:
     f_min: 20.0                # overrides the "likelihood: minimum frequency" derivation
     f_max: 896.0
+
+  sampling:
+    time_frame: detector        # geocentric | detector -- passed straight through to Jim's [sampling] section
+    sky_frame: equatorial
 
   sampler:
     type: flowmc                # flowmc | blackjax-ns-aw | blackjax-nss | blackjax-swig | blackjax-smc
@@ -110,6 +137,8 @@ jim:
   output:
     n_samples: 5000
     save_corner: true
+    corner_parameters: [M_c, q]
+    # any other Jim [output] field is passed straight through too
 
   prior:
     # Jim-native prior spec, used as-is instead of the priors: -> jim

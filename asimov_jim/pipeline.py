@@ -56,7 +56,13 @@ class Jim(Pipeline):
         not valid TOML), so the config is assembled as a real dict and
         serialized with ``tomli_w``, and only the resulting text is handed
         to the (near pass-through) bundled Liquid template.
+
+        Resolves ``production.rundir`` first: this hook runs before
+        ``build_dag()`` (see ``_resolve_rundir``'s docstring), but
+        ``_build_config()`` needs ``rundir`` set to compute the output/
+        checkpoint directories.
         """
+        self._resolve_rundir()
         rendered = tomli_w.dumps(self._build_config())
         self.production.meta["jim_rendered_toml"] = rendered
 
@@ -105,6 +111,9 @@ class Jim(Pipeline):
             channels = data_meta.get("strain_channels")
             if channels:
                 data["strain_channels"] = dict(channels)
+            psd_is_asd = data_meta.get("psd_is_asd")
+            if psd_is_asd:
+                data["psd_is_asd"] = dict(psd_is_asd)
         else:
             data.update(
                 {
@@ -146,14 +155,17 @@ class Jim(Pipeline):
         sampler_meta["checkpoint_dir"] = self._checkpoint_dir()
         sampler_meta.setdefault("checkpoint_interval", 600.0)
 
-        output = {
-            "dir": self._output_dir(),
-            "overwrite": True,
-            "n_samples": output_meta.get("n_samples", 5000),
-            "save_corner": bool(output_meta.get("save_corner", True)),
-        }
+        # Pass through every user-supplied output field (e.g.
+        # corner_parameters), then override only the fields this plugin
+        # itself owns.
+        output = dict(output_meta)
+        output.setdefault("n_samples", 5000)
+        output.setdefault("save_corner", True)
+        output["save_corner"] = bool(output["save_corner"])
+        output["dir"] = self._output_dir()
+        output["overwrite"] = True
 
-        return {
+        cfg = {
             "seed": jim_meta.get("seed", 0),
             "data": data,
             "waveform": waveform,
@@ -162,6 +174,12 @@ class Jim(Pipeline):
             "sampler": sampler_meta,
             "output": output,
         }
+
+        sampling = jim_meta.get("sampling")
+        if sampling:
+            cfg["sampling"] = dict(sampling)
+
+        return cfg
 
     @property
     def config_template(self):
@@ -233,6 +251,29 @@ class Jim(Pipeline):
             )
         return executable
 
+    def _resolve_rundir(self):
+        """
+        Resolve (and create) ``self.production.rundir``, shared by
+        ``before_config`` and ``build_dag``.
+
+        ``before_config()`` runs before ``build_dag()`` (see the call sites
+        in ``asimov/cli/manage.py``), so ``production.rundir`` may still be
+        unset at that point; ``_build_config()`` needs it (via
+        ``_output_dir``/``_checkpoint_dir``) to render the TOML, so both
+        entry points resolve it the same way rather than only ``build_dag``
+        doing so and leaving ``before_config`` to crash on ``None``.
+        """
+        if self.production.rundir:
+            self.production.rundir = os.path.abspath(self.production.rundir)
+        else:
+            self.production.rundir = os.path.join(
+                config.get("general", "rundir_default"),
+                self.production.event.name,
+                self.production.name,
+            )
+        os.makedirs(self.production.rundir, exist_ok=True)
+        return self.production.rundir
+
     def build_dag(self, dryrun=False):
         """
         Resolve the run directory and the location of the rendered TOML
@@ -244,15 +285,7 @@ class Jim(Pipeline):
         ``build_dag`` on every pipeline before ``submit_dag``, so this must
         exist.
         """
-        if self.production.rundir:
-            self.production.rundir = os.path.abspath(self.production.rundir)
-        else:
-            self.production.rundir = os.path.join(
-                config.get("general", "rundir_default"),
-                self.production.event.name,
-                self.production.name,
-            )
-        os.makedirs(self.production.rundir, exist_ok=True)
+        self._resolve_rundir()
 
         if self.production.event.repository:
             configs = self.production.event.repository.find_prods(
@@ -329,7 +362,7 @@ class Jim(Pipeline):
             "batch_name": batch_name,
         }
 
-        gpus = scheduler_meta.get("gpus", 1)
+        gpus = scheduler_meta.get("gpus", 0)
         if gpus:
             if isinstance(self.scheduler, Slurm):
                 submit_description["slurm_gres"] = f"gpu:{gpus}"

@@ -110,6 +110,43 @@ class TestBuildConfig:
         cfg = pipeline._build_config()
         assert cfg["data"]["strain_channels"] == {"H1": "H1:GDS-CALIB_STRAIN"}
 
+    def test_file_data_type_with_psd_is_asd(self, mock_production, mock_config):
+        mock_production.meta["jim"] = {
+            "data": {
+                "type": "file",
+                "strain_files": {"H1": "/data/h1.gwf"},
+                "psd_files": {"H1": "/data/h1_asd.npz"},
+                "psd_is_asd": {"H1": True},
+            }
+        }
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["data"]["psd_is_asd"] == {"H1": True}
+
+    def test_output_preserves_user_fields(self, mock_production, mock_config):
+        mock_production.meta["jim"] = {
+            "output": {"corner_parameters": ["M_c", "q"], "n_samples": 2000},
+        }
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["output"]["corner_parameters"] == ["M_c", "q"]
+        assert cfg["output"]["n_samples"] == 2000
+        # plugin-owned fields are still enforced regardless of user input
+        assert cfg["output"]["overwrite"] is True
+
+    def test_sampling_section_passed_through(self, mock_production, mock_config):
+        mock_production.meta["jim"] = {
+            "sampling": {"time_frame": "geocentric", "sky_frame": "equatorial"},
+        }
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["sampling"] == {"time_frame": "geocentric", "sky_frame": "equatorial"}
+
+    def test_sampling_section_omitted_when_not_set(self, mock_production, mock_config):
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert "sampling" not in cfg
+
     def test_jim_overrides_take_precedence(self, mock_production, mock_config):
         mock_production.meta["jim"] = {
             "seed": 42,
@@ -166,6 +203,22 @@ class TestBeforeConfig:
         parsed = tomllib.loads(rendered)
         assert parsed["data"]["type"] == "gwosc"
         assert parsed["output"]["overwrite"] is True
+
+    def test_before_config_resolves_rundir_when_unset(
+        self, mock_production, mock_config, temp_dir
+    ):
+        # before_config() runs before build_dag() (see asimov/cli/manage.py),
+        # so production.rundir may still be None here -- regression test for
+        # _build_config() crashing with TypeError from os.path.join(None, ...).
+        mock_production.rundir = None
+        mock_config.get = lambda section, key: (
+            temp_dir if (section, key) == ("general", "rundir_default") else ""
+        )
+        pipeline = Jim(mock_production)
+        pipeline.before_config()
+        assert mock_production.rundir == os.path.join(
+            temp_dir, mock_production.event.name, mock_production.name
+        )
 
 
 class TestBuildDag:
@@ -230,8 +283,22 @@ class TestSubmitDag:
         assert mock_production.status == "running"
         assert pipeline._scheduler.submit.called
 
+    def test_submit_dag_no_gpu_request_by_default(self, mock_production, mock_config, temp_dir):
+        mock_production.rundir = os.path.join(temp_dir, "run")
+        with patch("asimov_jim.pipeline.shutil.which", return_value="/opt/conda/bin/jim-run"):
+            pipeline = Jim(mock_production)
+            pipeline._scheduler = Mock()
+            pipeline._scheduler.submit.return_value = 1
+
+            pipeline.submit_dag(dryrun=False)
+
+        job = pipeline._scheduler.submit.call_args[0][0]
+        assert "request_gpus" not in job.kwargs
+        assert "slurm_gres" not in job.kwargs
+
     def test_submit_dag_requests_gpu_on_htcondor(self, mock_production, mock_config, temp_dir):
         mock_production.rundir = os.path.join(temp_dir, "run")
+        mock_production.meta["scheduler"]["gpus"] = 1
         with patch("asimov_jim.pipeline.shutil.which", return_value="/opt/conda/bin/jim-run"):
             pipeline = Jim(mock_production)
             pipeline._scheduler = Mock()  # not a Slurm instance
@@ -245,6 +312,7 @@ class TestSubmitDag:
 
     def test_submit_dag_requests_gpu_on_slurm(self, mock_production, mock_config, temp_dir):
         mock_production.rundir = os.path.join(temp_dir, "run")
+        mock_production.meta["scheduler"]["gpus"] = 1
         with patch("asimov_jim.pipeline.shutil.which", return_value="/opt/conda/bin/jim-run"):
             pipeline = Jim(mock_production)
             pipeline._scheduler = Mock(spec=Slurm)
