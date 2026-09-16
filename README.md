@@ -88,21 +88,38 @@ asimov manage submit      # submit the jim-run job
 asimov monitor            # poll for completion
 ```
 
-### The `jim:` metadata block
+### Settings: shared vocabulary first, `jim:` only for what's genuinely jim-specific
 
-Jim's own configuration (data source, waveform, sampler, output) doesn't map
-cleanly onto a single generic Asimov vocabulary, since Jim supports several
-data-loading modes (`gwosc`, `injection`, `file`) and five sampler backends
-each with their own settings. Common fields (`interferometers`,
-`"event time"`, `waveform.approximant`, `likelihood."minimum/maximum
-frequency"`) are picked up automatically from whichever blueprint set them
-(same as other pipelines), but anything Jim-specific is set under a `jim:`
-block *in the ledger blueprint* (an `analysis` blueprint for a single
-production, or an `event`/`configuration` blueprint if you want it shared
-across several). Its sub-sections mirror
-[Jim's own TOML config](https://gw-jax-team.github.io/Jim/stable/quickstart/)
-almost exactly, and the plugin renders that ledger input into Jim's actual
-`config.toml` file when you run `asimov manage build`:
+Most of Jim's configuration maps directly onto the same generic Asimov
+vocabulary every other pipeline reads — there's no `jim:` override layer
+for any of these:
+
+- `interferometers`, `"event time"` → `[data]` detectors/trigger time
+- `waveform.approximant`, `waveform."reference frequency"` → `[waveform]`
+- `likelihood."minimum/maximum frequency"` (lowest/highest across
+  detectors) → `[likelihood] f_min`/`f_max`
+- `priors:` → `[prior]`, via the standard `PriorInterface.convert()`
+  mechanism (see [Priors](#priors) below)
+- `sampler: {sampler: <name>, "sampler kwargs": {...}}` (the same shape
+  `bilby`/`pycbc` use) → `[sampler] type` + whatever kwargs Jim's chosen
+  backend takes, e.g.:
+
+  ```yaml
+  sampler:
+    sampler: flowmc              # flowmc | blackjax-ns-aw | blackjax-nss | blackjax-swig | blackjax-smc
+    "sampler kwargs":
+      n_chains: 1000
+      n_local_steps: 100
+      n_global_steps: 1000
+      # any other field for the chosen backend's config is passed straight through
+  ```
+
+A small `jim:` block, set *in the ledger blueprint* (an `analysis`
+blueprint for a single production, or an `event`/`configuration` blueprint
+if shared), covers the handful of things that have no generic Asimov
+equivalent at all — Jim's choice of data source, its `[sampling]` section,
+output options, and an escape hatch for the two prior types the generic
+`priors:` mechanism can't express:
 
 ```yaml
 # added to an analysis (or event/configuration) blueprint
@@ -111,28 +128,13 @@ jim:
   verbose: false
 
   data:
-    type: gwosc               # gwosc (default) | injection | file
+    type: gwosc               # gwosc (default) | injection | file -- see Data below
     # injection: sampling_frequency, duration, zero_noise, injection_parameters
     # file: duration, strain_files: {H1: ..., L1: ...}, psd_files: {...}, strain_channels: {...}, psd_is_asd: {...}
-
-  waveform:
-    approximant: IMRPhenomXPHM
-    f_ref: 20.0
-
-  likelihood:
-    f_min: 20.0                # overrides the "likelihood: minimum frequency" derivation
-    f_max: 896.0
 
   sampling:
     time_frame: detector        # geocentric | detector -- passed straight through to Jim's [sampling] section
     sky_frame: equatorial
-
-  sampler:
-    type: flowmc                # flowmc | blackjax-ns-aw | blackjax-nss | blackjax-swig | blackjax-smc
-    n_chains: 1000
-    n_local_steps: 100
-    n_global_steps: 1000
-    # any other field for the chosen sampler's config is passed straight through
 
   output:
     n_samples: 5000
@@ -142,8 +144,8 @@ jim:
 
   prior:
     # Jim-native prior spec, used as-is instead of the priors: -> jim
-    # conversion below. Only needed if you want a prior type the
-    # conversion below doesn't cover (rayleigh, uniform_sphere).
+    # conversion below. Only needed for a prior type the conversion
+    # doesn't cover (rayleigh, uniform_sphere).
     M_c: {type: uniform, min: 10.0, max: 80.0}
 ```
 
@@ -153,22 +155,38 @@ are always set by the plugin itself (to `<rundir>/checkpoint` and
 writes don't trip its refusal to overwrite an existing output directory)
 and can't be overridden.
 
+### Data
+
+> **Still settling:** Jim's own `file` data mode wants literal file paths
+> (`strain_files`/`psd_files`), not the frame-type + channel pairs
+> (`data: {channels, "frame types"}`) other pipelines resolve themselves —
+> Jim has no frame-discovery of its own. Whether `asimov-jim` should only
+> ever consume already-resolved paths (e.g. from a `gwdata`-style
+> production wired up via `needs:`, matching the
+> [GWOSC cookbook](https://asimov.readthedocs.io/en/latest/ligo-cookbook/working-with-gwosc.html)
+> pattern) via the generic `data: {"data files": {...}}` key, with Jim's
+> built-in `gwosc`/`injection` fetch modes kept only as a non-standard
+> fallback, is still being worked out — don't take the `jim: data:` shape
+> above as settled.
+
 ### Priors
 
-A standard Asimov `priors:` block is converted into Jim's `[prior]` table
-for the five prior types with an unambiguous match: `uniform`, `gaussian`,
-`sine`, `cosine` and `power_law` (Jim's `rayleigh` and `uniform_sphere`
-priors have no generic equivalent). **Parameter names are passed through
-unchanged** -- write them using Jim's own names (`M_c`, `q`, `s1_z`,
-`iota`, `d_L`, `t_c`, ...; see `jim-run --init` for the full reference
-parametrization). This plugin deliberately does not attempt to translate
-parameter names or spin/distance conventions from another pipeline's
-convention (e.g. Bilby's `chirp_mass`/`mass_ratio`), since guessing at that
-mapping risks silently producing a different physical prior than the one
-written in the ledger.
+Like every other pipeline, Jim reads priors from the ledger's generic
+`priors:` block, via a `JimPriorInterface.convert()` that translates each
+entry's `type` into Jim's own `[prior]` table. It covers the five prior
+types with an unambiguous field-for-field match: `uniform`, `gaussian`,
+`sine`, `cosine` and `power_law`. Two of Jim's own prior types have no
+equivalent in the generic `PriorSpecification` (`rayleigh`, `uniform_sphere`);
+for those, set the parameter directly under `jim: prior:` (see above),
+which takes precedence over the `priors:` conversion when given.
 
-An explicit `jim: prior:` block, if given, always takes precedence over the
-`priors:` conversion.
+**Parameter names are passed through unchanged** -- write them using Jim's
+own names (`M_c`, `q`, `s1_z`, `iota`, `d_L`, `t_c`, ...; see `jim-run
+--init` for the full reference parametrization). This plugin deliberately
+does not attempt to translate parameter names or spin/distance conventions
+from another pipeline's convention (e.g. Bilby's `chirp_mass`/`mass_ratio`),
+since guessing at that mapping risks silently producing a different
+physical prior than the one written in the ledger.
 
 ### GPUs
 

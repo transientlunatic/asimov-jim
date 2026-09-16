@@ -147,19 +147,50 @@ class TestBuildConfig:
         cfg = pipeline._build_config()
         assert "sampling" not in cfg
 
-    def test_jim_overrides_take_precedence(self, mock_production, mock_config):
-        mock_production.meta["jim"] = {
-            "seed": 42,
-            "waveform": {"approximant": "IMRPhenomXAS", "f_ref": 50.0},
-            "likelihood": {"f_min": 15.0, "f_max": 512.0},
-        }
+    def test_jim_seed_override(self, mock_production, mock_config):
+        mock_production.meta["jim"] = {"seed": 42}
         pipeline = Jim(mock_production)
         cfg = pipeline._build_config()
         assert cfg["seed"] == 42
+
+    def test_waveform_reads_generic_block_only(self, mock_production, mock_config):
+        # Not jim-specific: the same waveform: block every pipeline reads,
+        # no jim: override layer.
+        mock_production.meta["waveform"] = {
+            "approximant": "IMRPhenomXAS",
+            "reference frequency": 50.0,
+        }
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
         assert cfg["waveform"]["approximant"] == "IMRPhenomXAS"
         assert cfg["waveform"]["f_ref"] == 50.0
+
+    def test_likelihood_reads_generic_block_only(self, mock_production, mock_config):
+        mock_production.meta["likelihood"] = {
+            "minimum frequency": {"H1": 15.0, "L1": 15.0},
+            "maximum frequency": {"H1": 512.0, "L1": 512.0},
+        }
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
         assert cfg["likelihood"]["f_min"] == 15.0
         assert cfg["likelihood"]["f_max"] == 512.0
+
+    def test_sampler_reads_generic_sampler_kwargs_shape(self, mock_production, mock_config):
+        # Same generic sampler: {sampler: <name>, "sampler kwargs": {...}}
+        # shape bilby/pycbc use.
+        mock_production.meta["sampler"] = {
+            "sampler": "blackjax-ns-aw",
+            "sampler kwargs": {"n_chains": 500},
+        }
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["sampler"]["type"] == "blackjax-ns-aw"
+        assert cfg["sampler"]["n_chains"] == 500
+
+    def test_sampler_defaults_to_flowmc(self, mock_production, mock_config):
+        pipeline = Jim(mock_production)
+        cfg = pipeline._build_config()
+        assert cfg["sampler"]["type"] == "flowmc"
 
     def test_prior_falls_back_to_prior_interface(self, mock_production, mock_config):
         mock_production.priors = {

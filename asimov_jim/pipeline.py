@@ -76,11 +76,9 @@ class Jim(Pipeline):
         meta = self.production.meta
         jim_meta = meta.get("jim") or {}
         data_meta = jim_meta.get("data") or {}
-        waveform_meta = jim_meta.get("waveform") or {}
-        likelihood_meta = jim_meta.get("likelihood") or {}
-        sampler_meta = dict(jim_meta.get("sampler") or {})
         output_meta = jim_meta.get("output") or {}
         asimov_waveform = meta.get("waveform") or {}
+        asimov_sampler = meta.get("sampler") or {}
         ifos = meta.get("interferometers") or []
 
         data_type = data_meta.get("type", "gwosc")
@@ -125,13 +123,11 @@ class Jim(Pipeline):
                 }
             )
 
+        # Not jim-specific -- read the same waveform: block every other
+        # pipeline reads (bilby, pycbc, ...), no jim: override layer.
         waveform = {
-            "approximant": waveform_meta.get(
-                "approximant", asimov_waveform.get("approximant", "IMRPhenomXAS")
-            ),
-            "f_ref": waveform_meta.get(
-                "f_ref", asimov_waveform.get("reference frequency", 20.0)
-            ),
+            "approximant": asimov_waveform.get("approximant", "IMRPhenomXAS"),
+            "f_ref": asimov_waveform.get("reference frequency", 20.0),
         }
 
         prior = jim_meta.get("prior")
@@ -143,15 +139,19 @@ class Jim(Pipeline):
         f_max_by_ifo = asimov_likelihood.get("maximum frequency") or {}
         # Network min/max frequency: the lowest/highest per-detector value,
         # same convention as the sibling asimov-pycbc/pycbc.ini template --
-        # Jim's likelihood takes a single scalar rather than a per-detector one.
-        f_min_default = min(f_min_by_ifo.values()) if f_min_by_ifo else 20.0
-        f_max_default = max(f_max_by_ifo.values()) if f_max_by_ifo else 1024.0
+        # Jim's likelihood takes a single scalar rather than a per-detector
+        # one. Not jim-specific -- read directly from likelihood:, no jim:
+        # override layer.
         likelihood = {
-            "f_min": likelihood_meta.get("f_min", f_min_default),
-            "f_max": likelihood_meta.get("f_max", f_max_default),
+            "f_min": min(f_min_by_ifo.values()) if f_min_by_ifo else 20.0,
+            "f_max": max(f_max_by_ifo.values()) if f_max_by_ifo else 1024.0,
         }
 
-        sampler_meta.setdefault("type", "flowmc")
+        # Same generic sampler: {sampler: <name>, "sampler kwargs": {...}}
+        # shape bilby/pycbc use -- the backend name and its kwargs are
+        # naturally jim-specific content, but the container isn't.
+        sampler_meta = dict(asimov_sampler.get("sampler kwargs") or {})
+        sampler_meta.setdefault("type", asimov_sampler.get("sampler", "flowmc"))
         sampler_meta["checkpoint_dir"] = self._checkpoint_dir()
         sampler_meta.setdefault("checkpoint_interval", 600.0)
 
